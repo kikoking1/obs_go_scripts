@@ -1,0 +1,38 @@
+# Shared secrets. Every sibling project reads these from the parent via ../
+.env
+client_secret.json
+token.json
+
+# Compiled binaries (each sibling's own .gitignore also lists its specific
+# binary name; these patterns catch anything else built in the tree).
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*~
