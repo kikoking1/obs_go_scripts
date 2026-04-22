@@ -28,8 +28,9 @@ const (
 
 // scopes is the union of every scope any sibling tool needs. Broader scopes
 // supersede narrower ones (e.g. YoutubeScope covers YoutubeReadonlyScope), so
-// three entries cover all four projects:
+// three entries cover all sibling projects:
 //
+//	auto_delete_replay        -> youtube
 //	auto_email_sheets         -> youtube.readonly + sheets.readonly + gmail.send
 //	auto_enable_auto_startstop-> youtube
 //	auto_schedule_streams     -> youtube
