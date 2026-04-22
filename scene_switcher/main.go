@@ -21,14 +21,15 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// sceneFile is the authoritative runtime state that OBS polls via
-// GET /get-current-scene. It lives next to the binary and is created
+// sceneFile is the authoritative runtime state. OBS watches this file
+// directly (via its own file-watcher / lua script) and switches scenes
+// when the contents change. It lives next to the binary and is created
 // on first run with the default "LiveScene" value.
-const sceneFile = "scene.json"
+const sceneFile = "scene.txt"
 
-// The only two values ever written to scene.json. Keep these strings in
-// sync with whatever OBS-side automation reads from /get-current-scene
-// and switches scenes accordingly.
+// The only two values ever written to scene.txt. Keep these strings in
+// sync with whatever OBS-side automation reads the file and switches
+// scenes accordingly.
 const (
 	sceneLive      = "LiveScene"
 	sceneSacrament = "PassingSacramentScene"
@@ -50,20 +51,24 @@ const (
 	frameQuality = 75
 )
 
+// sceneState is the shape of the JSON body POSTed to /set-scene by the
+// browser UI. The on-disk file itself is plain text, not JSON.
 type sceneState struct {
 	Scene string `json:"scene"`
 }
 
-// sceneMu serializes reads/writes of scene.json so a concurrent OBS poll
-// never sees a partially-written file during a scene switch.
+// sceneMu serializes reads/writes of scene.txt. The atomic rename in
+// writeScene also ensures OBS's file-watcher never observes a
+// half-written file during a scene switch.
 var sceneMu sync.RWMutex
 
 var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
 
-// --- scene.json state helpers ---------------------------------------
+// --- scene.txt state helpers ----------------------------------------
 
-// ensureSceneFile creates scene.json with the default Live scene on
-// first run so OBS's first poll returns a valid payload.
+// ensureSceneFile creates scene.txt with the default Live scene on
+// first run so OBS's file-watcher has something valid to read
+// immediately.
 func ensureSceneFile() {
 	if _, err := os.Stat(sceneFile); err == nil {
 		return
@@ -73,32 +78,27 @@ func ensureSceneFile() {
 	}
 }
 
-func readScene() (sceneState, error) {
+// readScene returns the scene name stored in scene.txt with surrounding
+// whitespace trimmed, so a stray trailing newline introduced by an
+// editor doesn't break equality checks.
+func readScene() (string, error) {
 	sceneMu.RLock()
 	defer sceneMu.RUnlock()
 	data, err := os.ReadFile(sceneFile)
 	if err != nil {
-		return sceneState{}, err
+		return "", err
 	}
-	var s sceneState
-	if err := json.Unmarshal(data, &s); err != nil {
-		return sceneState{}, err
-	}
-	return s, nil
+	return strings.TrimSpace(string(data)), nil
 }
 
-// writeScene atomically replaces scene.json with {"scene": name} by
+// writeScene atomically replaces scene.txt with the bare scene name by
 // writing to a sibling temp file and renaming; rename is atomic on
-// POSIX so a concurrent OBS poll can never observe a half-written file.
+// POSIX so OBS's file-watcher can never observe a half-written file.
 func writeScene(name string) error {
 	sceneMu.Lock()
 	defer sceneMu.Unlock()
-	out, err := json.MarshalIndent(sceneState{Scene: name}, "", "  ")
-	if err != nil {
-		return err
-	}
 	tmp := sceneFile + ".tmp"
-	if err := os.WriteFile(tmp, out, 0644); err != nil {
+	if err := os.WriteFile(tmp, []byte(name), 0644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, sceneFile)
@@ -111,30 +111,11 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	scene, _ := readScene()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := indexTmpl.Execute(w, nil); err != nil {
+	if err := indexTmpl.Execute(w, scene); err != nil {
 		log.Printf("render index: %v", err)
 	}
-}
-
-func handleGetCurrentScene(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	s, err := readScene()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(s)
 }
 
 func handleSetScene(w http.ResponseWriter, r *http.Request) {
@@ -463,7 +444,6 @@ func main() {
 	log.Printf("scene state file: %s", abs)
 
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/get-current-scene", handleGetCurrentScene)
 	http.HandleFunc("/set-scene", handleSetScene)
 	http.HandleFunc("/stream", handleStream)
 
@@ -476,8 +456,8 @@ func main() {
 		fmt.Printf("  http://%s:%s/   (use this from your phone on the same LAN)\n", ip, p)
 	}
 	fmt.Println()
-	fmt.Printf("OBS scene poll endpoint: http://localhost:%s/get-current-scene\n", p)
-	fmt.Printf("Browser video stream:    ws://localhost:%s/stream\n", p)
+	fmt.Printf("OBS scene file:       %s\n", abs)
+	fmt.Printf("Browser video stream: ws://localhost:%s/stream\n", p)
 	fmt.Println()
 
 	srv := &http.Server{
@@ -562,7 +542,7 @@ const indexHTML = `<!DOCTYPE html>
             <button id="btn-live" class="live" onclick="setScene('LiveScene')">Live Video</button>
             <button id="btn-sacrament" class="sacrament" onclick="setScene('PassingSacramentScene')">Passing Sacrament</button>
         </div>
-        <div class="status"><span class="dot" id="dot"></span>Current scene: <b id="current">&mdash;</b></div>
+        <div class="status"><span class="dot" id="dot"></span>Current scene: <b id="current">{{.}}</b></div>
         <div class="fps" id="fps"></div>
     </div>
     <script>
@@ -615,9 +595,12 @@ const indexHTML = `<!DOCTYPE html>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ scene: name })
                 });
-                if (!res.ok) console.error('set-scene failed', res.status, await res.text());
+                if (!res.ok) {
+                    console.error('set-scene failed', res.status, await res.text());
+                    return;
+                }
+                render(name);
             } catch (e) { console.error(e); }
-            refreshStatus();
         }
         function render(scene) {
             document.getElementById('current').textContent = scene || '\u2014';
@@ -629,16 +612,9 @@ const indexHTML = `<!DOCTYPE html>
             dot.classList.toggle('live', liveActive);
             dot.classList.toggle('sacrament', sacActive);
         }
-        async function refreshStatus() {
-            try {
-                const res = await fetch('/get-current-scene', { cache: 'no-store' });
-                if (!res.ok) return;
-                const data = await res.json();
-                render(data.scene);
-            } catch (e) {}
-        }
-        refreshStatus();
-        setInterval(refreshStatus, 2000);
+        // The server rendered the current scene into #current on page load;
+        // sync the button/dot highlights to match it.
+        render(document.getElementById('current').textContent.trim());
     </script>
 </body>
 </html>

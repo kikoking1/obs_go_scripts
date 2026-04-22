@@ -3,8 +3,8 @@ client_secret.json
 token.json
 
 # Runtime state produced by the server — regenerated on first run.
-scene.json
-scene.json.tmp
+scene.txt
+scene.txt.tmp
 
 # Binaries for programs and plugins
 *.exe
