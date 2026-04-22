@@ -35,6 +35,7 @@ const (
 //	auto_enable_auto_startstop-> youtube
 //	auto_schedule_streams     -> youtube
 //	auto_sync_links_sheets    -> youtube.readonly + sheets
+//	scene_switcher            -> youtube.readonly
 var scopes = []string{
 	youtube.YoutubeScope,
 	sheets.SpreadsheetsScope,
