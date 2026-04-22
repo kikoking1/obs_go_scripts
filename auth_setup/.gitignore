@@ -1,7 +1,6 @@
 .env
 client_secret.json
 token.json
-auth_setup
 
 # Binaries for programs and plugins
 *.exe

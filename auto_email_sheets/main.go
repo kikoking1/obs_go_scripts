@@ -128,6 +128,8 @@ func fetchRecipientEmails(service *sheets.Service, spreadsheetID string) []strin
 			continue
 		}
 		s = strings.TrimSpace(s)
+		s = strings.TrimRight(s, ",")
+		s = strings.TrimSpace(s)
 		if s == "" {
 			continue
 		}

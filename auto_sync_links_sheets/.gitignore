@@ -1,7 +1,6 @@
 .env
 client_secret.json
 token.json
-auto_syncsheets
 
 # Binaries for programs and plugins
 *.exe
