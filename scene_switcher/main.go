@@ -2,25 +2,23 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/option"
-	"google.golang.org/api/youtube/v3"
-)
-
-// Shared credential files, consistent with sibling projects.
-const (
-	clientSecretFile = "../client_secret.json"
-	tokenFile        = "../token.json"
+	"github.com/andreykaipov/goobs"
+	"github.com/andreykaipov/goobs/api/requests/sources"
+	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
 
 // sceneFile is the authoritative runtime state that OBS polls via
@@ -29,17 +27,28 @@ const (
 const sceneFile = "scene.json"
 
 // The only two values ever written to scene.json. Keep these strings in
-// sync with whatever OBS-side automation (lua/python/browser source)
-// reads from /get-current-scene and switches scenes accordingly.
+// sync with whatever OBS-side automation reads from /get-current-scene
+// and switches scenes accordingly.
 const (
 	sceneLive      = "LiveScene"
 	sceneSacrament = "PassingSacramentScene"
 )
 
-// listenAddr binds to loopback only so the control panel isn't
-// accidentally exposed to the LAN. Change to ":44330" if access from
-// other devices on the same network is desired.
-const listenAddr = "127.0.0.1:44330"
+// listenAddr binds to every interface so a phone on the same LAN can
+// reach the control panel. Switch to "127.0.0.1:44330" to restrict to
+// the loopback interface if that's ever desired.
+const listenAddr = ":44330"
+
+// OBS screenshot cadence. At 15 fps + 75 quality JPEG each frame is
+// roughly 80-150 KB for a 1280x720 program scene, which is well
+// within LAN Wi-Fi headroom and light enough that OBS keeps smooth
+// encoding for the live broadcast.
+const (
+	frameFPS     = 15
+	frameWidth   = 1280
+	frameHeight  = 720
+	frameQuality = 75
+)
 
 type sceneState struct {
 	Scene string `json:"scene"`
@@ -49,31 +58,9 @@ type sceneState struct {
 // never sees a partially-written file during a scene switch.
 var sceneMu sync.RWMutex
 
-// ytSvc is used to discover the currently-active broadcast for embedding
-// on the index page. Nil-safe: if the service fails to initialize (no
-// token, auth error, etc.) the page still renders with a placeholder.
-var ytSvc *youtube.Service
-
 var indexTmpl = template.Must(template.New("index").Parse(indexHTML))
 
-func tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-	return tok, err
-}
-
-func getClient(config *oauth2.Config) *http.Client {
-	tok, err := tokenFromFile(tokenFile)
-	if err != nil {
-		log.Fatalf("Unable to read %s: %v\nRun `go run main.go` in ../auth_setup to create it.", tokenFile, err)
-	}
-	return config.Client(context.Background(), tok)
-}
+// --- scene.json state helpers ---------------------------------------
 
 // ensureSceneFile creates scene.json with the default Live scene on
 // first run so OBS's first poll returns a valid payload.
@@ -86,7 +73,6 @@ func ensureSceneFile() {
 	}
 }
 
-// readScene returns the current scene value stored in scene.json.
 func readScene() (sceneState, error) {
 	sceneMu.RLock()
 	defer sceneMu.RUnlock()
@@ -118,45 +104,20 @@ func writeScene(name string) error {
 	return os.Rename(tmp, sceneFile)
 }
 
-// findActiveBroadcastID returns the ID of the currently-live broadcast
-// on the authenticated channel, or "" if nothing is live right now.
-// The broadcast ID equals the YouTube video ID and is suitable for the
-// /embed/<id> URL on the index page.
-func findActiveBroadcastID() string {
-	if ytSvc == nil {
-		return ""
-	}
-	resp, err := ytSvc.LiveBroadcasts.List([]string{"id"}).
-		BroadcastStatus("active").
-		BroadcastType("all").
-		MaxResults(5).Do()
-	if err != nil {
-		log.Printf("lookup active broadcast: %v", err)
-		return ""
-	}
-	if len(resp.Items) == 0 {
-		return ""
-	}
-	return resp.Items[0].Id
-}
+// --- HTTP handlers --------------------------------------------------
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	// http.HandleFunc("/", ...) catches every unmatched path; 404 them
-	// so mistyped URLs don't silently render the control panel.
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	videoID := findActiveBroadcastID()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := indexTmpl.Execute(w, struct{ VideoID string }{VideoID: videoID}); err != nil {
+	if err := indexTmpl.Execute(w, nil); err != nil {
 		log.Printf("render index: %v", err)
 	}
 }
 
 func handleGetCurrentScene(w http.ResponseWriter, r *http.Request) {
-	// CORS-permissive so OBS browser sources (which often send a null
-	// origin) can poll the endpoint without extra configuration.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -172,8 +133,6 @@ func handleGetCurrentScene(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	// no-store so OBS always sees the freshest value instead of a cached
-	// response that would delay the scene switch.
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(s)
 }
@@ -200,27 +159,303 @@ func handleSetScene(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// --- OBS → browser frame hub ---------------------------------------
+
+// wsClient is a single connected browser. send is buffered so a slow
+// client doesn't block the frame producer; if the buffer fills, newer
+// frames are dropped rather than queued indefinitely.
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
+var (
+	hubMu        sync.Mutex
+	clients      = map[*wsClient]struct{}{}
+	producerStop context.CancelFunc // nil unless a producer is running
+)
+
+// addClient registers a new browser subscriber and starts the OBS
+// frame producer if this is the first one.
+func addClient(c *wsClient) {
+	hubMu.Lock()
+	defer hubMu.Unlock()
+	clients[c] = struct{}{}
+	if producerStop == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		producerStop = cancel
+		go produceFrames(ctx)
+	}
+}
+
+// removeClient is idempotent (see the map guard) so both the read
+// and write goroutines on a client can safely call it.
+func removeClient(c *wsClient) {
+	hubMu.Lock()
+	defer hubMu.Unlock()
+	if _, ok := clients[c]; !ok {
+		return
+	}
+	delete(clients, c)
+	close(c.send)
+	if len(clients) == 0 && producerStop != nil {
+		producerStop()
+		producerStop = nil
+	}
+}
+
+// broadcast fans a JPEG frame out to every subscriber. If a client's
+// send buffer is full we drop this frame for them rather than stalling
+// the producer — a dropped frame is always better than a stalled feed.
+func broadcast(frame []byte) {
+	hubMu.Lock()
+	defer hubMu.Unlock()
+	for c := range clients {
+		select {
+		case c.send <- frame:
+		default:
+		}
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	// Accept any origin; this server is a LAN tool where the operator
+	// reaches it via a bare IP and there is no cookie-based auth to
+	// protect from cross-site requests.
+	CheckOrigin: func(*http.Request) bool { return true },
+}
+
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("ws upgrade: %v", err)
+		return
+	}
+	c := &wsClient{conn: conn, send: make(chan []byte, 2)}
+	addClient(c)
+	log.Printf("stream client connected (%s); clients=%d", conn.RemoteAddr(), clientCount())
+
+	// Read pump: the browser doesn't actually send anything, but we
+	// need a goroutine draining reads so gorilla can detect close/ping
+	// failures and so ping/pong keep-alive works.
+	go func() {
+		defer func() {
+			removeClient(c)
+			_ = conn.Close()
+			log.Printf("stream client disconnected (%s); clients=%d", conn.RemoteAddr(), clientCount())
+		}()
+		conn.SetReadLimit(512)
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Write pump.
+	ping := time.NewTicker(30 * time.Second)
+	defer ping.Stop()
+	for {
+		select {
+		case frame, ok := <-c.send:
+			if !ok {
+				return
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				return
+			}
+		case <-ping.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func clientCount() int {
+	hubMu.Lock()
+	defer hubMu.Unlock()
+	return len(clients)
+}
+
+// produceFrames pulls JPEG screenshots of the current program scene
+// from OBS at `frameFPS` and broadcasts them to all subscribers.
+// Survives OBS restarts by reconnecting with a 2s backoff.
+func produceFrames(ctx context.Context) {
+	host := env("OBS_WS_HOST", "127.0.0.1")
+	port := env("OBS_WS_PORT", "4455")
+	password := os.Getenv("OBS_WS_PASSWORD")
+	addr := net.JoinHostPort(host, port)
+
+	var obs *goobs.Client
+	defer func() {
+		if obs != nil {
+			_ = obs.Disconnect()
+		}
+		log.Printf("frame producer stopped")
+	}()
+
+	ticker := time.NewTicker(time.Second / time.Duration(frameFPS))
+	defer ticker.Stop()
+
+	var currentScene string
+	var sceneCheckedAt time.Time
+
+	log.Printf("frame producer started (obs-websocket=%s, %dfps)", addr, frameFPS)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if obs == nil {
+				var opts []goobs.Option
+				if password != "" {
+					opts = append(opts, goobs.WithPassword(password))
+				}
+				c, err := goobs.New(addr, opts...)
+				if err != nil {
+					log.Printf("obs-websocket connect %s: %v (retrying in 2s)", addr, err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+					continue
+				}
+				obs = c
+				currentScene = ""
+				log.Printf("connected to obs-websocket at %s", addr)
+			}
+
+			// Refresh the program scene name periodically so we follow
+			// scene switches made in OBS (by the hotkey, the mobile
+			// control panel, the OBS-side lua, etc.).
+			if time.Since(sceneCheckedAt) > 500*time.Millisecond {
+				resp, err := obs.Scenes.GetCurrentProgramScene()
+				if err != nil {
+					log.Printf("get program scene: %v (reconnecting)", err)
+					_ = obs.Disconnect()
+					obs = nil
+					continue
+				}
+				name := resp.SceneName
+				if name == "" {
+					name = resp.CurrentProgramSceneName // older obs-websocket
+				}
+				currentScene = name
+				sceneCheckedAt = time.Now()
+			}
+
+			if currentScene == "" {
+				continue
+			}
+
+			params := sources.NewGetSourceScreenshotParams().
+				WithSourceName(currentScene).
+				WithImageFormat("jpg").
+				WithImageWidth(frameWidth).
+				WithImageHeight(frameHeight).
+				WithImageCompressionQuality(frameQuality)
+
+			resp, err := obs.Sources.GetSourceScreenshot(params)
+			if err != nil {
+				log.Printf("get screenshot: %v (reconnecting)", err)
+				_ = obs.Disconnect()
+				obs = nil
+				continue
+			}
+
+			raw, err := decodeDataURL(resp.ImageData)
+			if err != nil {
+				log.Printf("decode screenshot: %v", err)
+				continue
+			}
+			broadcast(raw)
+		}
+	}
+}
+
+// decodeDataURL strips a `data:<mime>;base64,` prefix (if present)
+// from obs-websocket's ImageData field and returns the raw JPEG bytes.
+func decodeDataURL(s string) ([]byte, error) {
+	if i := strings.Index(s, ";base64,"); i >= 0 {
+		s = s[i+len(";base64,"):]
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// --- misc helpers ---------------------------------------------------
+
+// lanIPv4s returns every reachable private IPv4 address on this host
+// (10/8, 172.16/12, 192.168/16) so we can print a usable LAN URL in
+// the startup banner without the operator having to look it up.
+func lanIPv4s() []string {
+	var out []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			ip4 := ip.To4()
+			if ip4 == nil || ip4.IsLoopback() || !ip4.IsPrivate() {
+				continue
+			}
+			s := ip4.String()
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// port extracts just the port from listenAddr so we can build URLs.
+func port() string {
+	if _, p, err := net.SplitHostPort(listenAddr); err == nil {
+		return p
+	}
+	return listenAddr
+}
+
+// --- main -----------------------------------------------------------
+
 func main() {
-	ctx := context.Background()
-
-	secret, err := os.ReadFile(clientSecretFile)
-	if err != nil {
-		log.Fatalf("Error reading %s: %v", clientSecretFile, err)
-	}
-	// Readonly is enough: this project only *reads* which broadcast is
-	// active. The stored token already covers this because auth_setup
-	// requests the broader YoutubeScope.
-	config, err := google.ConfigFromJSON(secret, youtube.YoutubeReadonlyScope)
-	if err != nil {
-		log.Fatalf("Unable to parse client secret file: %v", err)
-	}
-	client := getClient(config)
-
-	ytSvc, err = youtube.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		// Intentionally non-fatal: the scene-switching control plane is
-		// still usable even if we can't discover an active broadcast.
-		log.Printf("warning: YouTube service unavailable: %v", err)
+	// .env is shared at the repo root (../.env) so every sibling reads
+	// the same file. Errors here are non-fatal — the user may not have
+	// an .env yet and OBS_WS_PASSWORD has a sensible empty default.
+	if err := godotenv.Load("../.env"); err != nil {
+		log.Printf("note: couldn't load ../.env (%v); reading env vars from the environment instead", err)
 	}
 
 	ensureSceneFile()
@@ -230,45 +465,68 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/get-current-scene", handleGetCurrentScene)
 	http.HandleFunc("/set-scene", handleSetScene)
+	http.HandleFunc("/stream", handleStream)
 
-	fmt.Printf("Scene control panel: http://%s/\n", listenAddr)
-	fmt.Printf("OBS polling endpoint: http://%s/get-current-scene\n", listenAddr)
-	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+	p := port()
+	fmt.Println()
+	fmt.Println("Scene control panel:")
+	fmt.Printf("  http://localhost:%s/\n", p)
+	fmt.Printf("  http://127.0.0.1:%s/\n", p)
+	for _, ip := range lanIPv4s() {
+		fmt.Printf("  http://%s:%s/   (use this from your phone on the same LAN)\n", ip, p)
+	}
+	fmt.Println()
+	fmt.Printf("OBS scene poll endpoint: http://localhost:%s/get-current-scene\n", p)
+	fmt.Printf("Browser video stream:    ws://localhost:%s/stream\n", p)
+	fmt.Println()
+
+	srv := &http.Server{
+		Addr:         listenAddr,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 0, // WebSocket writes set their own per-message deadlines.
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-// indexHTML is kept inline (rather than using `embed`) so the project
-// remains a single .go file like the rest of the siblings. The template
-// is rendered via html/template, which context-escapes .VideoID safely.
+// indexHTML is kept inline so the project remains a single .go file.
+// The template is rendered via html/template; there are no dynamic
+// fields anymore (the video feed is pulled live over WS on the client).
 const indexHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Scene Control</title>
     <style>
         :root { color-scheme: dark; }
         * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background: #0d0f12; color: #eceff4; margin: 0; padding: 1.5rem;
+            background: #0d0f12; color: #eceff4; margin: 0; padding: 1.25rem;
+            -webkit-tap-highlight-color: transparent;
         }
         .container { max-width: 960px; margin: 0 auto; }
-        h1 { text-align: center; font-weight: 500; letter-spacing: .02em; margin: 0 0 1.25rem; }
+        h1 { text-align: center; font-weight: 500; letter-spacing: .02em; margin: 0 0 1rem; }
         .video-wrapper {
             position: relative; padding-bottom: 56.25%; height: 0;
             background: #000; border-radius: 12px; overflow: hidden;
             box-shadow: 0 10px 30px rgba(0,0,0,.4);
         }
-        .video-wrapper iframe, .video-wrapper .placeholder {
+        canvas#video {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: block; background: #000;
         }
-        .video-wrapper iframe { border: 0; }
         .placeholder {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             display: flex; align-items: center; justify-content: center;
-            color: #6b7280; font-size: 1.05rem; text-align: center; padding: 2rem;
+            color: #9ca3af; font-size: 1rem; text-align: center; padding: 2rem;
+            background: rgba(0,0,0,.55); transition: opacity .25s;
+            pointer-events: none;
         }
-        .buttons { display: flex; gap: 1rem; margin-top: 1.5rem; justify-content: center; flex-wrap: wrap; }
+        .placeholder.hidden { opacity: 0; }
+        .buttons { display: flex; gap: 1rem; margin-top: 1.25rem; justify-content: center; flex-wrap: wrap; }
         button {
             flex: 1; min-width: 200px; max-width: 320px;
             padding: 1.1rem 1.5rem; font-size: 1.05rem; font-weight: 600;
@@ -281,7 +539,7 @@ const indexHTML = `<!DOCTYPE html>
         button.live { background: #c62828; }
         button.sacrament { background: #283593; }
         button.active { box-shadow: 0 0 0 3px #fff, 0 0 24px rgba(255,255,255,.25); }
-        .status { text-align: center; margin-top: 1.25rem; color: #9ca3af; font-size: .95rem; }
+        .status { text-align: center; margin-top: 1rem; color: #9ca3af; font-size: .95rem; }
         .status b { color: #eceff4; font-weight: 600; }
         .dot {
             display: inline-block; width: 10px; height: 10px; border-radius: 50%;
@@ -290,32 +548,72 @@ const indexHTML = `<!DOCTYPE html>
         }
         .dot.live { background: #ef5350; box-shadow: 0 0 8px #ef5350; }
         .dot.sacrament { background: #5c6bc0; box-shadow: 0 0 8px #5c6bc0; }
+        .fps { text-align: center; margin-top: .4rem; color: #4b5563; font-size: .8rem; font-variant-numeric: tabular-nums; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Scene Control</h1>
         <div class="video-wrapper">
-            {{if .VideoID}}
-            <iframe src="https://www.youtube.com/embed/{{.VideoID}}?autoplay=1&mute=1"
-                    allow="autoplay; encrypted-media" allowfullscreen></iframe>
-            {{else}}
-            <div class="placeholder">No active live broadcast detected on the channel.</div>
-            {{end}}
+            <canvas id="video" width="1280" height="720"></canvas>
+            <div class="placeholder" id="placeholder">Waiting for OBS stream&hellip;</div>
         </div>
         <div class="buttons">
             <button id="btn-live" class="live" onclick="setScene('LiveScene')">Live Video</button>
             <button id="btn-sacrament" class="sacrament" onclick="setScene('PassingSacramentScene')">Passing Sacrament</button>
         </div>
         <div class="status"><span class="dot" id="dot"></span>Current scene: <b id="current">&mdash;</b></div>
+        <div class="fps" id="fps"></div>
     </div>
     <script>
+        const canvas      = document.getElementById('video');
+        const ctx         = canvas.getContext('2d');
+        const placeholder = document.getElementById('placeholder');
+        const fpsEl       = document.getElementById('fps');
+
+        let lastFrameAt = 0;
+        let frameTimes  = [];
+
+        function connectStream() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(proto + '//' + location.host + '/stream');
+            ws.binaryType = 'arraybuffer';
+            ws.onmessage = async (ev) => {
+                try {
+                    const blob = new Blob([ev.data], { type: 'image/jpeg' });
+                    const bitmap = await createImageBitmap(blob);
+                    if (canvas.width  !== bitmap.width)  canvas.width  = bitmap.width;
+                    if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
+                    ctx.drawImage(bitmap, 0, 0);
+                    bitmap.close();
+                    lastFrameAt = Date.now();
+                    placeholder.classList.add('hidden');
+                    frameTimes.push(lastFrameAt);
+                    const cutoff = lastFrameAt - 1000;
+                    while (frameTimes.length && frameTimes[0] < cutoff) frameTimes.shift();
+                    fpsEl.textContent = frameTimes.length + ' fps';
+                } catch (e) { console.error('frame decode:', e); }
+            };
+            ws.onclose = () => setTimeout(connectStream, 1500);
+            ws.onerror = () => { try { ws.close(); } catch (e) {} };
+        }
+
+        setInterval(() => {
+            if (Date.now() - lastFrameAt > 3000) {
+                placeholder.classList.remove('hidden');
+                placeholder.textContent = 'Waiting for OBS stream…';
+                fpsEl.textContent = '';
+            }
+        }, 1000);
+
+        connectStream();
+
         async function setScene(name) {
             try {
                 const res = await fetch('/set-scene', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({scene: name})
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scene: name })
                 });
                 if (!res.ok) console.error('set-scene failed', res.status, await res.text());
             } catch (e) { console.error(e); }
