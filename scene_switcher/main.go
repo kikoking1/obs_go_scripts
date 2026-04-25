@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/andreykaipov/goobs"
@@ -432,6 +434,17 @@ func port() string {
 // --- main -----------------------------------------------------------
 
 func main() {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		// Cron-friendly behavior: if an instance is already running on this
+		// port, exit quietly and successfully.
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return
+		}
+		log.Fatalf("listen %s: %v", listenAddr, err)
+	}
+	defer ln.Close()
+
 	// .env is shared at the repo root (../.env) so every sibling reads
 	// the same file. Errors here are non-fatal — the user may not have
 	// an .env yet and OBS_WS_PASSWORD has a sensible empty default.
@@ -465,7 +478,7 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 0, // WebSocket writes set their own per-message deadlines.
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
 }
