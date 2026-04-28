@@ -150,13 +150,22 @@ crontab -e
 Paste in (adjust `/home/kiko` to your own home if needed, and tweak the times to match your local timezone):
 
 ```cron
-0 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_email_sheets && ./auto_emailsheets >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_emailsheets.log 2>&1
-0 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_schedule_streams && ./autoschedulestream 1 >> /home/kiko/cronjobs/obs_go_scripts/logs/autoschedulestream.log 2>&1
-10 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_sync_links_sheets && ./auto_syncsheets >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_syncsheets.log 2>&1
-10 9 * * SUN cd /home/kiko/cronjobs/obs_go_scripts/auto_enable_auto_startstop && ./auto_enable_auto_startstop >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_enable_auto_startstop.log 2>&1
-20 9 * * SUN /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/start_obs.sh
-42 10 * * SUN /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/stop_obs.sh
-42 10 * * MON cd /home/kiko/cronjobs/obs_go_scripts/auto_delete_replay/ && ./auto_delete_replay >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_delete_replay.log 2>&1
+#0 20 * * SAT truncate -s 0 /home/kiko/cronjobs/obs_go_scripts/logs/*.log
+#0 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_email_sheets && ./auto_emailsheets >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_emailsheets.log 2>&1
+#0 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_schedule_streams && ./autoschedulestream 1 >> /home/kiko/cronjobs/obs_go_scripts/logs/autoschedulestream.log 2>&1
+#10 21 * * SAT cd /home/kiko/cronjobs/obs_go_scripts/auto_sync_links_sheets && ./auto_syncsheets >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_syncsheets.log 2>&1
+#0 22 * * SAT sudo /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/pi_sleep_wake_till_sunday.sh
+##wakes up on Sunday @ 8:30am
+#*/5 * * * SUN cd /home/kiko/cronjobs/obs_go_scripts/scene_switcher/ && ./scene_switcher >> /home/kiko/cronjobs/obs_go_scripts/logs/scene_switcher.log 2>&1
+#10 9 * * SUN cd /home/kiko/cronjobs/obs_go_scripts/auto_enable_auto_startstop && ./auto_enable_auto_startstop >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_enable_auto_startstop.log 2>&1
+#20 9 * * SUN /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/start_obs.sh
+#42 10 * * SUN /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/stop_obs.sh
+#0 11 * * SUN sudo /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/pi_sleep_wake_till_monday.sh
+##wakes up on Monday @ 10:30am
+#42 10 * * MON cd /home/kiko/cronjobs/obs_go_scripts/auto_delete_replay/ && ./auto_delete_replay >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_delete_replay.log 2>&1
+#42 11 * * MON cd /home/kiko/cronjobs/obs_go_scripts/auto_delete_replay/ && ./auto_delete_replay >> /home/kiko/cronjobs/obs_go_scripts/logs/auto_delete_replay.log 2>&1
+#0 12 * * MON sudo /usr/bin/bash /home/kiko/cronjobs/obs_go_scripts/pi_sleep_wake_till_saturday.sh
+##wakes up on Saturday @ 7pm
 ```
 
 Save and exit. To confirm it installed: `crontab -l`.
