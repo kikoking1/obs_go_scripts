@@ -15,7 +15,7 @@
 #   VIDEO_USB_NAME  substring of the video device's USB product string
 #                   (optional, default "UGREEN")
 #   AUDIO_USB_NAME  substring of the audio device's USB product string
-#                   (optional, default "KTB")
+#                   (optional, default "KT USB Audio")
 #
 # Matching is case-insensitive substring on /sys/bus/usb/devices/*/product.
 #
@@ -49,7 +49,7 @@ fi
 YOUTUBE_INGEST="rtmp://a.rtmp.youtube.com/live2/${STREAM_ID}"
 
 VIDEO_USB_NAME="${VIDEO_USB_NAME:-UGREEN}"
-AUDIO_USB_NAME="${AUDIO_USB_NAME:-KTB}"
+AUDIO_USB_NAME="${AUDIO_USB_NAME:-KT USB Audio}"
 
 # --- Find the USB port for each device by product name -------------------
 # /sys/bus/usb/devices/<port>/product is the USB product string the device
