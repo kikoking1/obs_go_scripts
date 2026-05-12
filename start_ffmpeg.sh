@@ -2,13 +2,22 @@
 #
 # start_ffmpeg.sh
 #
-# Capture from the USB 3.0 video device (first USB 3.0 port) and the USB 3.0
-# audio device (second USB 3.0 port) and push an H.264 + AAC RTMP stream to
-# a YouTube scheduled broadcast. The broadcast must already have
-# "Enable Auto Start" + "Enable Auto Stop" turned on, so YouTube goes live
-# the moment ffmpeg starts pushing bytes and stops when ffmpeg quits.
+# Capture video from one USB device (by product name, default "UGREEN" —
+# the UGREEN HDMI capture card) and audio from another USB device (by
+# product name, default "KTB" — the KTB USB Audio interface), then push an
+# H.264 + AAC RTMP stream to a YouTube scheduled broadcast. The broadcast
+# must already have "Enable Auto Start" + "Enable Auto Stop" turned on, so
+# YouTube goes live the moment ffmpeg starts pushing bytes and stops when
+# ffmpeg quits.
 #
-# The YouTube stream key is read from $REPO_ROOT/.env as STREAM_ID.
+# Configuration read from $REPO_ROOT/.env:
+#   STREAM_ID       YouTube stream key (required)
+#   VIDEO_USB_NAME  substring of the video device's USB product string
+#                   (optional, default "UGREEN")
+#   AUDIO_USB_NAME  substring of the audio device's USB product string
+#                   (optional, default "KTB")
+#
+# Matching is case-insensitive substring on /sys/bus/usb/devices/*/product.
 #
 
 set -euo pipefail
@@ -39,33 +48,62 @@ fi
 
 YOUTUBE_INGEST="rtmp://a.rtmp.youtube.com/live2/${STREAM_ID}"
 
-# --- Find USB 3.0 ports that have a device plugged in --------------------
-# /sys/bus/usb/devices/<port>/speed reports the negotiated speed in Mbps.
-# USB 3.0 = 5000, USB 3.1 gen2 = 10000, USB 2.0 = 480, USB 1.1 = 12.
-# Sorted by port path so the first hit is "the first USB 3.0 port".
-mapfile -t USB3_PORTS < <(
+VIDEO_USB_NAME="${VIDEO_USB_NAME:-UGREEN}"
+AUDIO_USB_NAME="${AUDIO_USB_NAME:-KTB}"
+
+# --- Find the USB port for each device by product name -------------------
+# /sys/bus/usb/devices/<port>/product is the USB product string the device
+# advertises (e.g. "UGREEN-25854", "KTB USB Audio"). Matching by name is
+# stable across reboots and tells the two devices apart, including when
+# one of them (the UGREEN) exposes both video and audio interfaces and we
+# only want its video.
+list_attached_usb() {
     for dev in /sys/bus/usb/devices/*; do
-        [[ -f "$dev/speed" ]] || continue
+        [[ -f "$dev/product" ]] || continue
+        local port
+        port="$(basename "$dev")"
+        [[ "$port" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
+        echo "  $port: $(cat "$dev/product" 2>/dev/null)"
+    done
+}
+
+find_usb_port_by_product() {
+    local needle lower_needle dev port product lower_product
+    needle="$1"
+    lower_needle="$(printf '%s' "$needle" | tr '[:upper:]' '[:lower:]')"
+    for dev in /sys/bus/usb/devices/*; do
+        [[ -f "$dev/product" ]] || continue
         port="$(basename "$dev")"
         # Skip root hubs ("usb1", "usb2", ...) and interface entries ("2-1:1.0").
         [[ "$port" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
-        speed="$(cat "$dev/speed" 2>/dev/null || true)"
-        if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed >= 5000 )); then
+        product="$(cat "$dev/product" 2>/dev/null || true)"
+        lower_product="$(printf '%s' "$product" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$lower_product" == *"$lower_needle"* ]]; then
             echo "$port"
+            return 0
         fi
-    done | sort
-)
+    done
+    return 1
+}
 
-if (( ${#USB3_PORTS[@]} < 2 )); then
-    echo "ERROR: expected 2 USB 3.0 devices (video + audio), found ${#USB3_PORTS[@]}: ${USB3_PORTS[*]:-none}" >&2
+VIDEO_PORT="$(find_usb_port_by_product "$VIDEO_USB_NAME" || true)"
+if [[ -z "$VIDEO_PORT" ]]; then
+    echo "ERROR: no USB device whose product name contains '$VIDEO_USB_NAME' is plugged in" >&2
+    echo "Currently attached USB devices:" >&2
+    list_attached_usb >&2
     exit 1
 fi
 
-VIDEO_PORT="${USB3_PORTS[0]}"
-AUDIO_PORT="${USB3_PORTS[1]}"
+AUDIO_PORT="$(find_usb_port_by_product "$AUDIO_USB_NAME" || true)"
+if [[ -z "$AUDIO_PORT" ]]; then
+    echo "ERROR: no USB device whose product name contains '$AUDIO_USB_NAME' is plugged in" >&2
+    echo "Currently attached USB devices:" >&2
+    list_attached_usb >&2
+    exit 1
+fi
 
-echo "USB 3.0 video port: $VIDEO_PORT"
-echo "USB 3.0 audio port: $AUDIO_PORT"
+echo "Video USB port ($VIDEO_USB_NAME): $VIDEO_PORT"
+echo "Audio USB port ($AUDIO_USB_NAME): $AUDIO_PORT"
 
 # --- Resolve /dev/videoN on the video port -------------------------------
 # A capture card usually registers several /dev/videoN nodes (one per V4L2
@@ -86,24 +124,27 @@ for v in /sys/class/video4linux/video*; do
 done
 
 if [[ -z "$VIDEO_DEV" ]]; then
-    echo "ERROR: no V4L2 video device found on USB 3.0 port $VIDEO_PORT" >&2
+    echo "ERROR: no V4L2 video device found on USB port $VIDEO_PORT ($VIDEO_USB_NAME)" >&2
     exit 1
 fi
 
 # --- Resolve ALSA hw:CARD on the audio port ------------------------------
+# Explicitly use the KTB (or whatever AUDIO_USB_NAME points at) card even
+# though the UGREEN also exposes an ALSA card -- we ignore the UGREEN's
+# audio entirely.
 AUDIO_CARD=""
 for s in /sys/class/sound/card*; do
     [[ -e "$s" ]] || continue
     real="$(readlink -f "$s")"
     if [[ "$real" == *"/${AUDIO_PORT}/"* ]]; then
-        AUDIO_CARD="$(basename "$s")"
-        AUDIO_CARD="${AUDIO_CARD#card}"
+        name="$(basename "$s")"
+        AUDIO_CARD="${name#card}"
         break
     fi
 done
 
 if [[ -z "$AUDIO_CARD" ]]; then
-    echo "ERROR: no ALSA sound card found on USB 3.0 port $AUDIO_PORT" >&2
+    echo "ERROR: no ALSA sound card found on USB port $AUDIO_PORT ($AUDIO_USB_NAME)" >&2
     exit 1
 fi
 
