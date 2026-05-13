@@ -16,6 +16,10 @@
 #                   (optional, default "UGREEN")
 #   AUDIO_USB_NAME  substring of the audio device's USB product string
 #                   (optional, default "KT USB Audio")
+#   AUDIO_CHANNELS  number of channels the ALSA capture device actually
+#                   exposes. Most cheap USB audio dongles are mono-in
+#                   (1), some are stereo-in (2). Default 1. The output
+#                   AAC stream is always stereo; mono inputs are upmixed.
 #
 # Matching is case-insensitive substring on /sys/bus/usb/devices/*/product.
 #
@@ -50,6 +54,7 @@ YOUTUBE_INGEST="rtmp://a.rtmp.youtube.com/live2/${STREAM_ID}"
 
 VIDEO_USB_NAME="${VIDEO_USB_NAME:-UGREEN}"
 AUDIO_USB_NAME="${AUDIO_USB_NAME:-KT USB Audio}"
+AUDIO_CHANNELS="${AUDIO_CHANNELS:-1}"
 
 # --- Find the USB port for each device by product name -------------------
 # /sys/bus/usb/devices/<port>/product is the USB product string the device
@@ -162,9 +167,9 @@ exec ffmpeg -hide_banner -loglevel info \
     -thread_queue_size 1024 \
     -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 -i "$VIDEO_DEV" \
     -thread_queue_size 1024 \
-    -f alsa -ac 2 -ar 48000 -i "hw:${AUDIO_CARD},0" \
+    -f alsa -ac "$AUDIO_CHANNELS" -ar 48000 -i "hw:${AUDIO_CARD},0" \
     -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p \
     -b:v 4500k -maxrate 4500k -bufsize 9000k \
     -g 60 -keyint_min 60 \
-    -c:a aac -b:a 128k -ar 48000 \
+    -c:a aac -b:a 128k -ar 48000 -ac 2 \
     -f flv "$YOUTUBE_INGEST"
