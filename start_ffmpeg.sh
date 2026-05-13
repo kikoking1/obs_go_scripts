@@ -167,7 +167,7 @@ exec ffmpeg -hide_banner -loglevel info \
     -thread_queue_size 1024 \
     -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 -i "$VIDEO_DEV" \
     -thread_queue_size 1024 \
-    -f alsa -ac "$AUDIO_CHANNELS" -ar 48000 -i "hw:${AUDIO_CARD},0" \
+    -f alsa -channels "$AUDIO_CHANNELS" -sample_rate 48000 -i "hw:${AUDIO_CARD},0" \
     -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p \
     -b:v 4500k -maxrate 4500k -bufsize 9000k \
     -g 60 -keyint_min 60 \
