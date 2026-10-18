@@ -260,3 +260,10 @@ These files are the first place to look when Sunday morning goes sideways.
 | OBS won't start (OpenGL error).                                            | Make sure the launch command uses `MESA_GL_VERSION_OVERRIDE=3.3`.                                                                                  |
 | `scene_switcher` shows "Waiting for OBS stream…" forever.                  | OBS isn't running, or obs-websocket isn't enabled, or your `OBS_WS_PASSWORD` in `.env` doesn't match the one in OBS.                               |
 | Cron runs but binaries say "command not found" or similar.                 | Rebuild the binary on the Pi itself (architecture mismatch). Don't copy binaries across machines.                                                  |
+
+
+# keep laptop running
+
+gnome
+
+`gnome-session-inhibit --inhibit idle:suspend --reason "DND build" sleep infinity`
